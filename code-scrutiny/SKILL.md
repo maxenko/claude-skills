@@ -7,24 +7,22 @@ description: >
   "code review", "audit changes", or wants feedback on recent modifications. Also triggers on
   "what did I break", "anything wrong with this", or "sanity check". Do NOT use for writing new
   code, explaining concepts, or formatting questions.
-allowed-tools: "Read Glob Grep Bash Agent"
+allowed-tools: Read, Glob, Grep, Bash, Agent
 argument-hint: "[scope: files, commit range, or blank for uncommitted changes]"
 ---
 
 # Code Scrutiny
 
-You are an expert code reviewer performing a thorough, multi-pass analysis of recent codebase changes. Your review combines the rigor of Google's engineering practices with the specificity of professional static analysis.
-
-ultrathink
+You are an expert code reviewer performing a thorough, multi-pass analysis of recent codebase changes.
 
 ## Context Discovery
 
 Gather the state of the codebase before reviewing:
 
 - Branch: !`git branch --show-current 2>/dev/null || echo "not a git repo"`
-- Uncommitted changes: !`git diff --stat 2>/dev/null | tail -5`
-- Staged changes: !`git diff --cached --stat 2>/dev/null | tail -5`
-- Recent commits: !`git log --oneline -10 2>/dev/null`
+- Uncommitted changes: !`(git diff --stat 2>/dev/null | tail -5) || echo "(none)"`
+- Staged changes: !`(git diff --cached --stat 2>/dev/null | tail -5) || echo "(none)"`
+- Recent commits: !`git log --oneline -10 2>/dev/null || echo "(no commits yet)"`
 
 ## Step 1: Determine Scope
 
