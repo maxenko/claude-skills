@@ -50,22 +50,50 @@ If `$ARGUMENTS` is not one of the above, treat as `all` and note the unrecognize
 
 Read the project's configuration to understand what CI expects.
 
-### 1a: Project structure
+### 1a: Exhaustive crate discovery
+
+**Do not skim.** You must enumerate *every* `Cargo.toml` in the repo and classify each one. Missing a single crate means its fmt/clippy issues will ship red.
+
+Find every manifest (prune common build/vendor dirs):
 
 ```bash
-cat Cargo.toml
+find . \( -name target -o -name node_modules -o -name vendor -o -name .git \) -prune -o -name Cargo.toml -print
 ```
 
-Determine and record these **resolved flags** -- use them consistently in all subsequent cargo commands:
+Also run a Glob fallback in case `find` is unavailable:
 
-- **Workspace?** (`[workspace]` present) -- add `--workspace`
+```
+Glob: **/Cargo.toml
+```
+
+Read **every** `Cargo.toml` found. For each, record:
+
+- **Has `[workspace]`?** -- it is a workspace root (independent or virtual manifest).
+- **Has `[package]` only?** -- it is a standalone crate OR a workspace member.
+- **Workspace member?** -- matched by a `members = [...]`/`default-members` glob of some ancestor workspace root, OR `[package].workspace = "../path"` set. Use the ancestor workspace's `members` globs to decide; do not assume directory nesting alone implies membership.
+- **Excluded?** -- listed in the ancestor workspace's `exclude = [...]`. Excluded crates are *not* covered by `--workspace` and must be checked separately.
+
+Build a **check-roots list** -- the minimal set of directories that, when each is visited with the appropriate cargo invocation, covers every crate exactly once:
+
+1. Every directory containing a `Cargo.toml` with `[workspace]` (covered via `--workspace` from that directory).
+2. Every standalone `Cargo.toml` **not** claimed by any workspace root above (covered by a direct `cargo` call in its directory -- no `--workspace`).
+3. Every crate listed in a workspace's `exclude` array (treat as standalone).
+
+Print the final check-roots list back to the user before proceeding (one line per root: `path -- workspace|standalone -- flags`). This is your contract: Phases 2-4 iterate over *this exact list*.
+
+Verification -- the union of crates reachable from the check-roots list must equal the full set of `Cargo.toml` files discovered above. If any crate is unaccounted for, stop and re-classify before proceeding.
+
+### 1a.1: Per-root resolved flags
+
+For each check-root, record these **resolved flags** from its `Cargo.toml` -- use them consistently in all subsequent cargo commands for that root:
+
+- **Workspace?** (`[workspace]` present) -- add `--workspace`. Standalone crates do **not** take `--workspace`.
 - **Edition?** (2024 has different rustfmt defaults and match ergonomics)
 - **MSRV?** (`rust-version` field -- if below 1.81, use `#[allow]` not `#[expect]`)
 - **Features safe?** Only use `--all-features` if no mutually exclusive features. Signs of conflict: `compile_error!` in cfg blocks, CI jobs testing specific feature combos separately, `#[cfg(not(feature = "..."))]` impl blocks. When in doubt, use default features.
 - **Workspace lints?** Check for `[workspace.lints.clippy]` -- if present, respect it. Do not add per-item attributes that contradict workspace lint policy.
-- **Nested workspaces?** A repo can contain multiple independent Cargo workspaces (e.g., `desktop/win/Cargo.toml` with its own `[workspace]`). The root `[workspace]` does not cover these -- they require separate `cd` + cargo commands. Scan the CI workflow (Phase 1b) for `cd` steps to find them, or search for additional `Cargo.toml` files with `[workspace]` sections.
 
-In all subsequent cargo commands, replace `[flags]` with the resolved flags from this step (e.g., `--workspace --all-features`).
+Flags are **per root**. A repo can have one workspace using `--all-features` and a standalone tool using default features -- keep them separate. In subsequent cargo commands, replace `[flags]` with the flags resolved for *that root*.
 
 ### 1b: CI workflow
 
@@ -76,14 +104,16 @@ ls .github/workflows/*.yml .github/workflows/*.yaml 2>/dev/null
 If workflow files exist, read them all. **CI is the ground truth** -- extract every `run:` step related to fmt, clippy, check, test, or doc. Record the **exact commands including `cd` paths, `&&` chains, flags, and environment variables**. These become the command templates you replay in Phases 2-4.
 
 Pay special attention to:
-- **`cd` commands**: CI may `cd` into subdirectories for nested workspaces. Each `cd` + cargo chain is a separate workspace root that needs its own pass.
-- **Multiple jobs doing the same check in different directories**: This means the repo has multiple independent workspaces. Build a list of `(directory, cargo_command)` pairs.
+- **`cd` commands**: CI may `cd` into subdirectories for nested workspaces or standalone crates. Each `cd` + cargo chain corresponds to a check-root.
+- **Multiple jobs doing the same check in different directories**: Cross-check these against your Phase 1a check-roots list -- they must match.
 - **Flags**: If CI uses `--all-features`, you use `--all-features`. If CI uses `-W clippy::pedantic`, you use that.
 - **Environment variables**: If CI sets `RUSTFLAGS: "-Dwarnings"`, note this.
 
-Build a **workspace root list** -- one entry per independent workspace the CI checks. For single-workspace projects this is just the repo root. For multi-workspace projects this is every directory CI `cd`s into.
+Reconcile the CI-derived roots with your Phase 1a check-roots list:
+- **CI covers a root you didn't find** -- add it to the list and re-verify your crate enumeration.
+- **You found a crate CI does not check** -- still check it locally (this skill makes *every* crate green), and flag the gap so Phase 5 can add a CI step for it.
 
-If no workflow exists, note this for Phase 5 and assume the repo root is the only workspace.
+If no workflow exists, note this for Phase 5. Phase 1a's check-roots list is authoritative.
 
 ### 1c: Toolchain configuration
 
@@ -117,9 +147,9 @@ Check `msrv` -- if set, it takes precedence over `rust-version` in Cargo.toml. T
 
 Skip if `$ARGUMENTS` is `clippy` or `workflow`.
 
-For each workspace root identified in Phase 1b, run the format-and-verify cycle. Use **absolute paths** for `cd` and chain commands with `&&` in a **single Bash call** -- never split `cd` and cargo into separate Bash invocations (the working directory does not persist between calls).
+Iterate over **every check-root from Phase 1a** -- workspace roots *and* standalone crates. Do not stop at the first root, and do not stop at the first failure; collect and fix for all roots, then re-verify all. Use **absolute paths** for `cd` and chain commands with `&&` in a **single Bash call** -- never split `cd` and cargo into separate Bash invocations (the working directory does not persist between calls).
 
-Note: `cargo fmt` uses `--all` (not `--workspace`) to format all packages. Do not substitute `[flags]` into fmt commands.
+Note: `cargo fmt` uses `--all` for workspace roots. For standalone crates, plain `cargo fmt` formats just that crate; `--all` is also safe. Do not substitute `[flags]` into fmt commands.
 
 ### 2a: Auto-format and verify
 
@@ -129,11 +159,13 @@ If CI commands were extracted in Phase 1b, replay them with the fix step prepend
 cd /absolute/path/to/desktop/win && cargo fmt --all && cargo fmt --all --check
 ```
 
-If no CI workflow was found, use the default for each workspace root:
+If no CI workflow was found (or CI doesn't cover this root), use the default for each check-root:
 
 ```bash
-cd /absolute/path/to/workspace && cargo fmt --all && cargo fmt --all --check
+cd /absolute/path/to/root && cargo fmt --all && cargo fmt --all --check
 ```
+
+Run this for **every entry** in the Phase 1a check-roots list. Keep a tally -- roots attempted vs. roots in the list -- and do not exit Phase 2 until those numbers match.
 
 If `--check` still fails, investigate:
 - **Generated code not excluded**: Add `#[rustfmt::skip]` or exclude in `rustfmt.toml`
@@ -148,7 +180,7 @@ If `--check` still fails, investigate:
 
 Skip if `$ARGUMENTS` is `fmt` or `workflow`.
 
-For each workspace root identified in Phase 1b, run the clippy fix cycle. Always use **absolute paths** for `cd` and chain dependent commands with `&&` in a **single Bash call**.
+Iterate over **every check-root from Phase 1a** -- workspace roots *and* standalone crates. Run the full clippy fix cycle for each. Always use **absolute paths** for `cd` and chain dependent commands with `&&` in a **single Bash call**. Remember: standalone crates do *not* take `--workspace`; workspace roots do.
 
 ### 3a: Auto-fix
 
@@ -211,16 +243,16 @@ Skip if `$ARGUMENTS` is `workflow`.
 
 Phases 2-3 verify individual concerns during the fix loop. This phase re-runs the relevant CI commands together to catch cross-concern regressions (e.g., clippy fixes that re-break formatting).
 
-**Replay the exact CI commands** from Phase 1b, for each workspace root, using absolute paths and `&&` chains in single Bash calls. Run only the checks matching the current focus:
+**Replay the exact CI commands** from Phase 1b for each CI-covered root, plus run the defaults below for any Phase 1a check-root not covered by CI. Use absolute paths and `&&` chains in single Bash calls. Run only the checks matching the current focus:
 - **`fmt`**: fmt check commands only
 - **`clippy`**: clippy check commands only
 - **`all`**: both, e.g., `cd /absolute/path && cargo fmt --all --check && cargo clippy --all-targets [flags] -- -D warnings`
 
-If no CI workflow was found, use the defaults above.
+If no CI workflow was found, use the defaults above for every check-root.
 
 Use extended timeouts (600000ms) for commands involving compilation.
 
-**All workspace roots must pass.** If any fails, return to the relevant phase.
+**Every check-root from Phase 1a must pass.** Before leaving Phase 4, print a per-root pass/fail table -- roots attempted must equal roots in the list, and every row must be green. If any fails, return to the relevant phase for that specific root.
 
 ---
 
@@ -300,7 +332,9 @@ If all checks already passed, say so and stop. Do not manufacture work.
 
 - **Replay CI commands verbatim.** Use the exact commands, flags, `cd` paths, and `&&` chains from the CI workflow. Convert relative paths to absolute. Do not improvise your own command structure.
 - **Never split `cd` and cargo into separate Bash calls.** The working directory does not persist between Bash tool invocations. Always chain with `&&` in a single call: `cd /abs/path && cargo ...`
-- **Cover every workspace root.** If CI checks multiple directories, you must check all of them. Missing a workspace root means missing its failures.
+- **Enumerate every `Cargo.toml` in the repo, do not skim.** Use `find` (pruning `target`, `node_modules`, `vendor`, `.git`) plus a `**/Cargo.toml` Glob fallback. Classify each as workspace root, workspace member, standalone, or `exclude`d. Print the final check-roots list before Phase 2.
+- **Cover every check-root.** Workspace roots (via `--workspace`), standalone crates (direct `cargo` in their directory), and `exclude`d crates (treated as standalone) all need their own fmt + clippy pass. Not just what CI already checks -- every crate in the folder tree.
+- **Crate count invariant.** Roots processed in Phase 2/3/4 must equal the Phase 1a check-roots list. Report the tally; do not declare success otherwise.
 - **Only fix issues that appear in command output.** Do not invent warnings.
 - **Read files before editing.** Never guess at line numbers or content.
 - **Verify every fix compiles.** Run `cargo check` after non-trivial edits.
