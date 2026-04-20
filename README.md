@@ -1,6 +1,6 @@
 # claude-skills
 
-A curated collection of **14 production-grade [Claude Code](https://claude.com/claude-code) skills** for planning, code review, refactoring, Rust workflows, and authoring skills themselves.
+A curated collection of **15 production-grade [Claude Code](https://claude.com/claude-code) skills** for planning, code review, refactoring, Rust workflows, and authoring skills themselves.
 
 Each skill is a self-contained Markdown bundle that Claude Code auto-triggers when its description matches what you're doing — or that you can invoke explicitly with `/<skill-name>`.
 
@@ -27,6 +27,7 @@ skill-name/
 | **plan-eval** | Evaluates a plan for soundness, completeness, executability | *"review this plan"*, *"is this plan good"* |
 | **plan-execute** | Implements a `.md` plan file with per-step verification | *"execute this plan"*, *"implement the plan"* |
 | **code-scrutiny** | Deep review of recent changes for bugs, dupes, smells | *"review my changes"*, *"scrutinize this"* |
+| **arch-audit** | Whole-codebase architectural review — smells, coupling, tech debt | *"audit the architecture"*, *"why is this codebase hard to change"* |
 | **refactor-pro** | Structural refactor for readability and maintainability | *"refactor"*, *"clean up this code"* |
 | **bug-hunt** | Hunts real defects through rotating expert lenses | *"find bugs"*, *"what could go wrong"* |
 | **app-harden** | Audits for runtime stability, resource leaks, DoS vectors | *"harden this"*, *"pre-flight before shipping"* |
@@ -97,11 +98,13 @@ Good for pre-commit reviews or before shipping a risky change.
 
 ```
 You: scrutinize the last 3 commits
+You: audit the architecture of this repo
 You: find bugs in src/payment/
 You: refactor this — it's a mess
 You: harden the /webhook endpoint for production
 ```
 
+`code-scrutiny` reviews **recent diffs**; `arch-audit` zooms out to the **whole codebase** — tangled dependencies, coupling, structural debt — grounded in Ousterhout, Fowler, Hickey, Feathers, and connascence theory.
 `bug-hunt` looks for **real** defects (concrete failing input + observable consequence), not style nits.
 `app-harden` finds runaway logs, missing timeouts, SSRF, secret leaks, crash loops, and similar runtime issues.
 
