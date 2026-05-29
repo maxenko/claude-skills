@@ -1,0 +1,64 @@
+// SPDX-License-Identifier: MIT
+//@version=6
+
+// ──────────────────────────────────────────────────────────────────────────
+// Library: LibraryName
+// Description: Brief description of what the library exports.
+// Usage:
+//   import username/LibraryName/1 as lib
+//   lib.someFunction(close, 14)
+// ──────────────────────────────────────────────────────────────────────────
+
+library("LibraryName", overlay = true)
+
+// ──────────────────────────────────────────────────────────────────────────
+// TYPES
+// ──────────────────────────────────────────────────────────────────────────
+//@type      Pivot point with bar index, price, and direction.
+//@field bar     Bar index where the pivot occurred.
+//@field price   Price level of the pivot.
+//@field isHigh  True for a pivot high, false for a pivot low.
+export type Pivot
+    int   bar
+    float price
+    bool  isHigh
+
+// ──────────────────────────────────────────────────────────────────────────
+// EXPORTED FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────
+
+//@function     Returns the value of `expr` from the most-recently-closed bar of `tf`.
+//              Non-repainting, consistent between history and realtime.
+//@param sym    Symbol to request (e.g. syminfo.tickerid).
+//@param tf     Higher timeframe string (e.g. "D", "60", "240").
+//@param expr   Series expression evaluated in the (sym, tf) context.
+//@returns      The value of `expr` from the previously-closed HTF bar.
+export f_secure(simple string sym, simple string tf, series float expr) =>
+    request.security(sym, tf, expr[1], lookahead = barmerge.lookahead_on)
+
+
+//@function     Detects swing pivots without lookahead-induced repainting.
+//              Returns na until `right` bars after the pivot has formed.
+//@param src    Source series.
+//@param left   Bars to the left required to be lower (for highs) / higher (for lows).
+//@param right  Bars to the right required to confirm.
+//@returns      Pivot object, or na if no pivot at this bar.
+export method confirmedPivot(series float src, simple int left, simple int right, simple bool findHigh) =>
+    pivotPrice = findHigh ? ta.pivothigh(src, left, right) : ta.pivotlow(src, left, right)
+    Pivot result = na
+    if not na(pivotPrice)
+        result := Pivot.new(bar = bar_index - right, price = pivotPrice, isHigh = findHigh)
+    result
+
+
+//@function     Rounds a price to the symbol's mintick.
+//@param price  Price to round.
+//@returns      Price rounded to the symbol's mintick.
+export roundToTick(series float price) =>
+    math.round_to_mintick(price)
+
+
+// ──────────────────────────────────────────────────────────────────────────
+// DEMO PLOT (libraries require at least one output for compilation)
+// ──────────────────────────────────────────────────────────────────────────
+plot(close, "Close", display = display.none)

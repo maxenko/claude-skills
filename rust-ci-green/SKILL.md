@@ -141,6 +141,27 @@ cat clippy.toml 2>/dev/null || cat .clippy.toml 2>/dev/null
 
 Check `msrv` -- if set, it takes precedence over `rust-version` in Cargo.toml. The Cargo.toml `rust-version` is only used as a fallback when `clippy.toml` does not set `msrv`. If both are set and differ, flag the mismatch.
 
+### 1f: Platform skew detection (local vs CI runner)
+
+`cargo clippy` only lints code reachable under the **active target's `cfg`**. Code inside `#[cfg(target_os = "linux")]` blocks is invisible to clippy on Windows, and vice versa. If CI runs on a different OS than your local box and the source has any `cfg(target_*)` attributes, you can be locally green and CI-red on the same commit.
+
+Detect it:
+
+1. **CI runner OS(s)**: from each job's `runs-on:` line (`ubuntu-latest`, `windows-latest`, `macos-latest`, or a matrix). Map to the rustc triple — `ubuntu-latest` → `x86_64-unknown-linux-gnu`, `windows-latest` → `x86_64-pc-windows-msvc`, `macos-latest` → `aarch64-apple-darwin` (M-series; older runners may be x86_64).
+2. **Local host triple**: `rustc -vV | grep host:`
+3. **Platform-cfg surface area** -- grep the workspace for cfg gates that branch on platform:
+   ```bash
+   rg -l '\bcfg(_attr)?\s*\(\s*(target_os|target_family|target_arch|target_env|target_pointer_width|target_endian|unix|windows)\b' --type rust
+   ```
+   Also include shorthand `#[cfg(unix)]` / `#[cfg(windows)]` and combinations like `any(...)` / `not(...)` / `all(...)`.
+
+If CI runner OS differs from local host **and** the grep returns any files, mark the project as **platform-cfg-skewed**. Phase 4 will run cross-target clippy for the CI triple. Otherwise, host-target clippy is sufficient.
+
+Common skewed lints that surface only on the "other" OS:
+- `unused_attributes` from `#[ignore = "..."]` stacked under `#[cfg_attr(not(target_os = "..."), ignore = "...")]` (two `#[ignore]`s on the cfg-true side).
+- `dead_code` / `unused_imports` for items used only in a platform branch the local target excludes.
+- `clippy::needless_borrow` / `unnecessary_cast` differences between MSVC and GNU ABI types (rare, but happens with FFI).
+
 ---
 
 ## Phase 2: Fix Formatting
@@ -217,6 +238,8 @@ Read each file before editing. For each warning, follow the tiered decision fram
 
 **Suppression syntax**: Prefer `#[expect(lint, reason = "...")]` over `#[allow]` (stabilized Rust 1.81). If MSRV is below 1.81, use `#[allow(lint)]` with a code comment. Narrowest scope possible. Never put `#[deny(warnings)]` in source code.
 
+**Attribute-edit footgun**: rustfmt has its own opinions about how long-form attributes break across lines, and they're not always derivable from `max_width`. In particular `#[cfg_attr(cond, inner_attr = "...")]` with a multi-argument inner attribute is reflowed onto multiple lines even when the single-line form fits in 100 cols. After hand-editing any attribute (or any line that came out of an Edit / replace_all), re-run `cargo fmt --check` for that root *before* declaring the warning fixed — don't trust eyeballed line lengths.
+
 ### 3d: Iterate
 
 ```bash
@@ -253,6 +276,39 @@ If no CI workflow was found, use the defaults above for every check-root.
 Use extended timeouts (600000ms) for commands involving compilation.
 
 **Every check-root from Phase 1a must pass.** Before leaving Phase 4, print a per-root pass/fail table -- roots attempted must equal roots in the list, and every row must be green. If any fails, return to the relevant phase for that specific root.
+
+### 4b: Cross-target clippy when platform-cfg-skewed
+
+Skip if Phase 1f did **not** flag the project as platform-cfg-skewed.
+
+Otherwise, for each distinct CI runner OS that differs from your host:
+
+1. Install the target if missing:
+   ```bash
+   rustup target add <ci-triple>
+   ```
+2. Replay the CI clippy command(s) for each affected check-root with `--target <ci-triple>`:
+   ```bash
+   cd /absolute/path && cargo clippy --workspace --all-targets --target <ci-triple> [flags] -- -D warnings
+   ```
+
+**Native-dep cross-compile may fail** (cc-rs / `libsqlite3-sys` / `openssl-sys` / similar need a C cross-toolchain you probably don't have on Windows). Two fallbacks:
+
+- **Mini-repro**: extract the smallest possible snippet exhibiting the cfg pattern into a fresh crate with no native deps and run cross-target clippy there. Sufficient for attribute / lint-eval skew (`unused_attributes`, `dead_code`, etc.) since those don't depend on linking.
+  ```bash
+  mkdir -p /tmp/cfg-check/src && cat > /tmp/cfg-check/Cargo.toml <<EOF
+  [package]
+  name = "cfg-check"
+  version = "0.0.0"
+  edition = "2021"
+  publish = false
+  EOF
+  # paste the suspect cfg pattern into src/lib.rs, then:
+  cd /tmp/cfg-check && cargo clippy --all-targets --target <ci-triple> -- -D warnings
+  ```
+- **Symmetric-by-construction fix**: when the fix replaces a stacked `#[attr]` + `#[cfg_attr(not(X), attr)]` with two mutually exclusive `#[cfg_attr(X, attr)]` + `#[cfg_attr(not(X), attr)]`, exactly one attribute resolves on every target by construction. No cross-target run can prove or disprove this -- the symmetry does. Document the reasoning in the commit message.
+
+If both fallbacks are blocked, document the gap in the Phase 6 report so the user knows host-target verification did not cover everything.
 
 ---
 
@@ -318,6 +374,7 @@ Provide a concise summary:
 
 - **Fmt**: X files reformatted (or "already clean")
 - **Clippy**: Y warnings fixed, Z suppressed with reason (or "already clean")
+- **Cross-target**: triple(s) verified, or "host-only — no platform cfg detected", or "skipped — native deps blocked cross-compile, mini-repro used / symmetry argued"
 - **Workflow**: created / updated / already correct
 - **Badge**: added / fixed / already present
 - **Toolchain**: aligned / recommended pinning / already consistent
@@ -335,6 +392,8 @@ If all checks already passed, say so and stop. Do not manufacture work.
 - **Enumerate every `Cargo.toml` in the repo, do not skim.** Use `find` (pruning `target`, `node_modules`, `vendor`, `.git`) plus a `**/Cargo.toml` Glob fallback. Classify each as workspace root, workspace member, standalone, or `exclude`d. Print the final check-roots list before Phase 2.
 - **Cover every check-root.** Workspace roots (via `--workspace`), standalone crates (direct `cargo` in their directory), and `exclude`d crates (treated as standalone) all need their own fmt + clippy pass. Not just what CI already checks -- every crate in the folder tree.
 - **Crate count invariant.** Roots processed in Phase 2/3/4 must equal the Phase 1a check-roots list. Report the tally; do not declare success otherwise.
+- **Host-target clippy is not enough when CI runs on a different OS.** Code under `#[cfg(not(target_os = "your_host"))]` is invisible to your clippy run; the same lint may fire only on the CI runner. If Phase 1f flagged platform-cfg skew, Phase 4b is mandatory before declaring CI green. Common smoking gun: `unused_attributes` on `#[ignore]` stacked with `#[cfg_attr(not(X), ignore)]`.
+- **Re-verify after every hand edit.** Any time you Edit/Write a Rust file — even outside the main fix loop, even to fix a CI failure surfaced by the user — the *last* thing before reporting done must be re-running fmt and clippy on the file's check-root. Edits made after Phase 4's pass-table are the most common source of "fixed it, pushed it, CI red again" — usually rustfmt reflowing a hand-typed attribute. No exceptions: every edit cycle ends with `cargo fmt --check && cargo clippy --all-targets [flags] -- -D warnings` for the affected root.
 - **Only fix issues that appear in command output.** Do not invent warnings.
 - **Read files before editing.** Never guess at line numbers or content.
 - **Verify every fix compiles.** Run `cargo check` after non-trivial edits.

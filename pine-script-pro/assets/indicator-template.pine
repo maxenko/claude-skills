@@ -1,0 +1,91 @@
+// SPDX-License-Identifier: MIT
+//@version=6
+
+// ──────────────────────────────────────────────────────────────────────────
+// Description: TEMPLATE — replace this with what the indicator does.
+// Repainting status: Non-repainting (signals gated on barstate.isconfirmed).
+// ──────────────────────────────────────────────────────────────────────────
+
+indicator(title         = "Indicator Name",
+          shorttitle    = "Short",
+          overlay       = true,
+          max_lines_count    = 500,
+          max_labels_count   = 500,
+          max_boxes_count    = 500,
+          max_polylines_count = 100)
+
+// ──────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ──────────────────────────────────────────────────────────────────────────
+const color BULL_COLOR = #26a69a
+const color BEAR_COLOR = #ef5350
+const color NEUTRAL    = color.new(color.gray, 50)
+
+// ──────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ──────────────────────────────────────────────────────────────────────────
+// Calculation
+lengthInput   = input.int(14, "Length", minval = 1, maxval = 500,
+    group = "Calculation",
+    tooltip = "Lookback bars for the main calculation.")
+sourceInput   = input.source(close, "Source",
+    group = "Calculation")
+
+// Signals
+confirmedInput = input.bool(true, "Signal only on bar close",
+    group = "Signals",
+    tooltip = "When on, signals only fire after the bar closes. Off = live (repainting) signals.")
+
+// Display
+showLineInput   = input.bool(true,  "Show line",       group = "Display")
+showLabelsInput = input.bool(false, "Show value labels", group = "Display")
+bullColorInput  = input.color(BULL_COLOR, "Bull color", group = "Display", inline = "col")
+bearColorInput  = input.color(BEAR_COLOR, "Bear color", group = "Display", inline = "col")
+
+// Debug
+debugInput = input.bool(false, "Verbose Pine Logs",
+    group = "Debug",
+    tooltip = "Enables log.info() output. Use the Pine Logs pane to inspect.")
+
+// ──────────────────────────────────────────────────────────────────────────
+// FUNCTIONS
+// ──────────────────────────────────────────────────────────────────────────
+//@function Non-repainting higher-timeframe request.
+f_secure(simple string sym, simple string tf, series float expr) =>
+    request.security(sym, tf, expr[1], lookahead = barmerge.lookahead_on)
+
+// ──────────────────────────────────────────────────────────────────────────
+// CALCULATIONS
+// ──────────────────────────────────────────────────────────────────────────
+float maValue   = ta.sma(sourceInput, lengthInput)
+bool  longSig   = ta.crossover(sourceInput, maValue)  and (not confirmedInput or barstate.isconfirmed)
+bool  shortSig  = ta.crossunder(sourceInput, maValue) and (not confirmedInput or barstate.isconfirmed)
+color plotColor = sourceInput > maValue ? bullColorInput : bearColorInput
+
+// ──────────────────────────────────────────────────────────────────────────
+// VISUALS
+// ──────────────────────────────────────────────────────────────────────────
+plot(showLineInput ? maValue : na, "MA", plotColor, linewidth = 2)
+
+plotshape(longSig,  "Long",  shape.triangleup,   location.belowbar, bullColorInput, size = size.tiny)
+plotshape(shortSig, "Short", shape.triangledown, location.abovebar, bearColorInput, size = size.tiny)
+
+if showLabelsInput and (longSig or shortSig)
+    label.new(bar_index, sourceInput,
+        text     = str.format("{0,number,#.##}", maValue),
+        style    = longSig ? label.style_label_up : label.style_label_down,
+        color    = longSig ? bullColorInput : bearColorInput,
+        textcolor = color.white,
+        size     = size.small)
+
+if debugInput and (longSig or shortSig)
+    log.info("Signal bar={0,number,#}: long={1}, short={2}, ma={3,number,#.##}",
+        bar_index, longSig, shortSig, maValue)
+
+// ──────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ──────────────────────────────────────────────────────────────────────────
+alertcondition(longSig,  title = "Long signal",
+    message = "Long signal on {{ticker}} at {{close}}")
+alertcondition(shortSig, title = "Short signal",
+    message = "Short signal on {{ticker}} at {{close}}")
