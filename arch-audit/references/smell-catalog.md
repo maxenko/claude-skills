@@ -12,6 +12,7 @@ Thresholds are defaults. Adjust by language convention and project size, but do 
 - **[Lens 2: Cohesion and complexity](#lens-2-cohesion-and-complexity)** — god class · long method · long parameter list · shallow module · lasagna / excessive layering · divergent change · feature envy · data class
 - **[Lens 3: Abstraction quality](#lens-3-abstraction-quality)** — anemic domain model · primitive obsession · unenforced invariants / smart constructors · illegal states representable · shotgun parsing · missing aggregate · complected concerns · functional core / imperative shell absent · unidirectional data flow absent · scattered error handling / try-catch pyramid · observability complected · missing domain events · leaky abstraction · domain depends on infrastructure / missing ports · missing anti-corruption layer · missing bounded context · speculative generality · wrong abstraction · temporal coupling · implicit state machine / scattered entity state · event sourcing gap · CQRS gap · implicit dataflow pipeline
 - **[Lens 4: Evolution signals](#lens-4-evolution-signals)** — hotspot · shotgun surgery · parallel inheritance / parallel switch · fossil / dead code · ownership diffusion · temporal hotspot mismatch
+- **[Data ingestion & serving subsystem](#data-ingestion--serving-subsystem-cross-cutting)** (cross-cutting) — no ingest/serve boundary · load-all (no streaming) · sequential parallelizable ingest · no fault tolerance / not resumable / not idempotent · no backpressure / unbounded buffering · blocking UI on latency-bound I/O · no lifecycle/progress events for the UI · observability not designed into the boundary · **the canonical robust ingest→serve abstraction**
 - **[Paradigm adaptations](#paradigm-adaptations)** — Rust/Go · Functional (Haskell/Elixir/Clojure/F#) · Frontend (React/Vue/Svelte) · Data pipelines (Airflow/dbt/Spark)
 - **[Smells deliberately NOT on this list](#smells-deliberately-not-on-this-list)**
 
@@ -404,6 +405,103 @@ Static analysis alone misses half of real problems. The commit log carries the r
 
 ---
 
+## Data ingestion & serving subsystem (cross-cutting)
+
+Load this section when running the **mandatory ingest→serve pass** (SKILL.md, Phase 3). It fires whenever the system both **ingests** data from a latency-bound or fallible source (files, DB, sockets, HTTP/streaming feeds, message queues, sensors, large CSV/Parquet/columnar blobs) and **serves** it to a consumer (UI, API, another module, export). These smells span Coupling, Cohesion, and Abstraction; they are grouped here because the audit treats the data path as one thing and the canonical refactor (last entry) addresses them together.
+
+These are **promotion-rule** smells: when the ingest→serve path exists, the absence of a robust, observable, non-blocking abstraction is *always* a candidate finding — sized by `decision-frameworks.md` §13, never silently dropped. Proportionality governs *how much* robustness, not *whether* the boundary, the status stream, and a non-blocking UI exist.
+
+### No ingestion/serving boundary (scattered inline I/O)
+**Signal**: Raw I/O — `open`, `read`, `parse`, `query`, `connect` — appears inline in UI event handlers, controllers, request handlers, and domain code, with no single `DataSource`/`Repository`/`Store`/ingestion-engine type owning it. There is no seam at which to add retry, streaming, caching, or observability because the I/O is everywhere.
+**Detection**: grep for file/socket/HTTP/DB primitives (`read_to_string`, `File::open`, `fs.readFile`, `open(`, `requests.get`, `fetch(`, `SELECT`, `cursor.execute`, `socket.recv`) across UI/handler/domain directories; count distinct files containing them. Check whether a data-access module exists and whether everything routes through it.
+**Threshold**: ingest/serve primitives in ≥3 files outside a dedicated data module; OR any I/O inside a UI event handler / render path; OR the same source parsed in >1 place.
+**Why it matters**: Hexagonal Architecture (Cockburn) — I/O is a detail that belongs behind a port in domain vocabulary; scattering it complects transport with everything and leaves no place to enforce robustness. Without the boundary, every later fix (streaming, retry, progress) has to be made N times.
+**Refactor**: see **the canonical robust ingest→serve abstraction** below — define the port, route all I/O through it, delete the inline calls.
+**Overkill**: a one-shot script that reads one file once and exits; a library whose single job *is* the I/O primitive.
+
+### Load-all ingestion (no streaming / windowing / pagination)
+**Signal**: The whole input is read into memory (`read_to_string`, `io.ReadAll`, `.collect()` of an entire query, `JSON.parse(entireFile)`, `pd.read_csv(whole)`) before anything is served. Memory scales with input size; first byte served waits for last byte read.
+**Detection**: grep for whole-read calls feeding a single in-memory collection that the serve path then indexes; look for absence of `BufReader`/iterator/generator/cursor/`LIMIT … OFFSET`/range reads. Symptom history: "OOM on big file", "slow to open large dataset", "works on the sample, dies on prod data".
+**Threshold**: any unbounded whole-input read where input size is attacker- or user-controlled or grows over time; OR served data set materially larger than the visible/queried slice.
+**Why it matters**: Memory becomes a hard ceiling on dataset size and a latency floor on first result. Streaming (bounded memory, incremental results) is the difference between "opens instantly, scrolls smoothly" and "freezes, then maybe crashes". Kleppmann, *DDIA* ch. 10–11 (batch vs. stream).
+**Refactor**: stream/iterate the source; window or paginate the serve side to the visible/queried range; index incrementally as chunks arrive. Keep only the working set resident; page the rest. For columnar/large files, read by row-group/range, not whole-file.
+**Overkill**: inputs provably small and bounded (a config file, a few-KB fixture); when the entire dataset must be resident for the algorithm (in-memory analytics on a known-small set).
+
+### Sequential ingest of parallelizable work
+**Signal**: Independent ingest units (one per file / day / shard / partition / key / endpoint) processed in a serial `for` loop, so the CPU sits idle on I/O wait and wall-clock is the *sum* of per-unit latencies.
+**Detection**: a loop over files/days/sources each doing blocking I/O + decode with no concurrency primitive (`join_all`, worker pool, `errgroup`, `asyncio.gather`, `rayon`, channel fan-out). Profile/log signature: total time ≈ Σ per-unit time; one core busy, disk/network underutilized.
+**Threshold**: ≥N independent units (N≈4) processed serially where units share nothing and the per-unit work is I/O-bound or CPU-bound-and-divisible.
+**Why it matters**: Embarrassingly-parallel work run serially is throughput left on the floor. Staged, pipelined concurrency (SEDA — Welsh, Culler & Brewer, 2001) lets read overlap decode overlap index; bounded fan-out saturates the slow resource without overwhelming it.
+**Refactor**: partition by the natural key; process units through a **bounded** worker pool (cap concurrency to protect the source and memory); pipeline the stages so read ∥ decode ∥ index. Preserve ordering only where the serve side needs it (merge at the end, or key-order within partition).
+**Overkill**: a handful of tiny units where setup cost exceeds the gain; sources that rate-limit hard enough that one connection is already the ceiling; strict total-ordering requirements that defeat parallelism (document the constraint).
+
+### No fault tolerance / not resumable / not idempotent
+**Signal**: One bad record, dropped connection, or transient error aborts the whole ingest (`panic`/throw/`os.exit`). No retry, or retry with no backoff/jitter, or retry on non-transient errors. Re-running re-ingests from the start; re-ingesting the same input double-counts (no dedupe). Long-lived ingest has no supervisor — a crash ends it permanently.
+**Detection**: grep the parse/ingest loop for `unwrap`/`expect`/`panic!`/bare `throw`/`raise` on per-record paths; check whether errors are isolated per unit or propagate to abort; look for a resume cursor/checkpoint table/offset file; look for an idempotency/dedupe key (`(source, offset)`, `(symbol, ts)`, message id, content hash); check for retry with `backoff`+`jitter` and error classification (retry only timeouts/5xx/connection-refused). Bug history: "import failed at row 4M, started over", "duplicate rows after re-run", "feed dropped overnight and never recovered".
+**Threshold**: any side-effecting ingest that (a) aborts the batch on a single record error, OR (b) is not resumable across a crash, OR (c) double-applies on re-run, OR (d) has a long-lived reader with no restart.
+**Why it matters**: All real I/O is at-least-once and partially-failing. Per-unit isolation + retry-with-backoff (Nygard, *Release It!*), resumable checkpoints, and idempotent effect (Kleppmann; Morling, *On Idempotency Keys*) are what separate "robust pipeline" from "demo". Supervised restart / let-it-crash (OTP) keeps long-lived ingest alive.
+**Refactor**: isolate failures per unit — a bad record becomes an `Err`/`Result` pushed into the stream and skipped+reported, not a process abort. Retry *transient* errors only, with exponential backoff + jitter + a max-elapsed cap. Add a resume cursor/checkpoint so re-runs continue from the last committed position. Add an idempotency key so re-ingest is a no-op on already-seen units. Supervise long-lived readers (restart from clean state on unhandled error).
+**Overkill**: pure in-process transforms of trusted, already-validated in-memory data; a one-shot import where "re-run from scratch" is acceptable and cheap (document it).
+
+### No backpressure / unbounded buffering
+**Signal**: An unbounded channel/queue/list sits between a fast producer (ingest) and a slower consumer (serve/index/UI). The producer never blocks; the buffer grows without limit. Or: no queue at all, so a burst of input is held entirely in memory.
+**Detection**: grep for unbounded channels/queues (`unbounded_channel`, `chan` with no cap, `Queue()` with no `maxsize`, `Channel.CreateUnbounded`, `Subject` with no buffer policy); check whether the producer can outrun the consumer and what happens when it does. Symptom: memory climbs under load and never recovers; "fine until a burst".
+**Threshold**: any producer/consumer hand-off across a latency boundary using an unbounded buffer; OR a burst-prone source with no overflow policy.
+**Why it matters**: An unbounded buffer converts a transient speed mismatch into an OOM. Backpressure (Reactive Streams; SEDA admission control) makes the slow stage push back on the fast one — the system degrades by *slowing*, not by *dying*. Bounded queue + explicit overflow policy (block / drop-oldest / drop-newest / reject / sample) is a design decision the audit should force into the open.
+**Refactor**: bound every inter-stage queue; pick and name the overflow policy per stage (block the producer for durable work; drop-oldest for live/lossy feeds like charts/telemetry; reject+signal for request paths). Propagate backpressure end-to-end so the slowest stage governs intake.
+**Overkill**: provably bounded producers (a fixed small batch) where the buffer can never exceed a safe size.
+
+### Blocking UI on latency-bound I/O
+**Signal**: File open, network connect, query, or parse runs **on the UI thread / inside an event or render handler**, freezing the interface until it completes. The window stops repainting; input is ignored; the OS may show "Not Responding".
+**Detection**: grep for I/O primitives inside UI event handlers, render functions, component bodies, `onClick`/`onwheel`/`useEffect`/`paint`/`view` paths; look for blocking calls not dispatched to a worker/async task/thread pool. Symptom: "app freezes when I open a file", "spinner but the whole window is stuck".
+**Threshold**: any latency-bound I/O (anything that can exceed ~16 ms) on the UI thread; any synchronous read in a render/redraw path; re-reading/re-parsing the source on every redraw.
+**Why it matters**: The UI thread is a real-time deadline (one frame). Blocking it is the single most visible robustness failure to a user. The fix is the imperative-shell/functional-core split (Bernhardt) plus moving I/O off-thread and serving from an in-memory store.
+**Refactor**: run all latency-bound work off the UI thread (async task / worker / thread pool / background actor). The UI dispatches a request and returns immediately; results and progress arrive as pushed events (next smell). Render reads the in-memory `Store`, never the source — no re-parsing on redraw.
+**Overkill**: trivially fast, bounded reads known to complete within a frame (a tiny cached config). Even then, prefer async for consistency.
+
+### No lifecycle / progress events for the UI ("what are we waiting on?")
+**Signal**: There is latency-bound work but the UI has no way to tell the user what is happening. Best case a bare indeterminate spinner; worst case a frozen window. The user cannot distinguish "connecting", "downloading", "parsing", "retrying", "stuck", or "done".
+**Detection**: check whether the data boundary exposes a typed status/lifecycle the UI subscribes to, or whether the UI polls/guesses/shows a static spinner. Look for a `LoadStatus`/`IngestState` enum and an observer/signal/event channel the UI reads. Absence + presence of latency-bound work = finding.
+**Threshold**: any user-facing latency-bound operation with no per-phase status surfaced to the UI; OR progress that the UI computes by reaching into I/O internals rather than receiving as data.
+**Why it matters**: "Always keep the user informed about what is going on, through appropriate feedback within reasonable time" (Nielsen, *Visibility of system status*, heuristic #1). Uncertainty, not latency, is what makes waiting feel broken. The boundary already knows the phase; it must *publish* it.
+**Refactor**: model the data boundary's life as an explicit state machine and emit it as a stream the UI observes — e.g. `Idle → Opening → Connecting → Reading{pct} → Parsing{pct} → Indexing → Ready/Serving → Retrying{attempt} → Error{cause, retryable} → Done`. The UI maps each state to a message (and progress/ETA where known) via the **Observer** pattern (signals / event bus / reactive stream). Progress is **data pushed from the boundary**, never the UI reaching in. The *same* stream feeds logs/metrics (next smell), so there is one source of truth.
+**Overkill**: operations guaranteed sub-100 ms; non-interactive batch jobs with no human waiting (use logs/metrics instead).
+
+### Observability not designed into the I/O boundary
+**Signal**: To answer "is the ingest progressing, stalled, or failing, and how fast?" you must read scattered `print`/`log` lines buried in the parsing code — or there is nothing. No metrics on latency, throughput, queue depth, error/retry rate, or bytes in/out. Logs are interleaved with domain logic rather than emitted at the boundary.
+**Detection**: grep for `log.`/`print`/`console.log` inside parse/decode/transform functions (observability complected with logic); check for a metrics surface (latency histogram, counter for records/errors/retries, queue-depth gauge) at the boundary; check whether the lifecycle stream (previous smell) is also the source for logs/metrics or whether they are independent and inconsistent.
+**Threshold**: any non-trivial ingest/serve subsystem with no boundary-level metrics; OR observability calls scattered through ≥3 transform functions; OR logs and UI status derived from different, divergent sources.
+**Why it matters**: A robust I/O subsystem is one you can *see*. Observability is a first-class concern of the boundary, not an afterthought sprinkled in the core (Hickey — don't complect *what it does* with *how it's watched*). One typed event stream at the boundary should fan out to logs, metrics/traces (OpenTelemetry-style), and the UI — keeping all three consistent by construction.
+**Refactor**: emit the lifecycle state machine + structured events from the boundary; derive logs, metrics (latency histogram, throughput, queue depth, error/retry counters, bytes), and UI status from that *one* stream. Remove `log`/`print` from the pure filters. Instrument at stage edges (read/decode/index/serve), not inside the transforms.
+**Overkill**: trivial bounded reads; a script where stdout is sufficient. Don't stand up a metrics pipeline for a 50-line importer — but still emit a single status value.
+
+### The canonical robust ingest→serve abstraction (the refactor these compose into)
+When the mandatory pass shows gaps, the prescription is almost always one composed design, not eight separate fixes. Name it explicitly in the finding; it is the existing catalog entries assembled for the I/O subsystem.
+
+**Shape**:
+1. **Port (Hexagonal)** — a `DataSource` interface in domain vocabulary: `open(spec) -> Stream<Result<Chunk, IngestError>>` for ingest; a serve-side `Store`/`Repository` queried by the visible/needed range. The UI and domain depend only on these interfaces; concrete file/DB/socket adapters live in `infra/`.
+2. **Pipes-and-filters pipeline** — `read → decode → validate/normalize → index/store`, each a **pure filter** with explicit `In -> Out` types; I/O only at the endpoints (functional core, imperative shell — Bernhardt). The pipeline definition is *data* (a list of stages) so stages can be added/reordered/parallelized.
+3. **Staged, bounded concurrency (SEDA)** — partition by natural key; a bounded worker pool per stage; read ∥ decode ∥ index overlap; **bounded** inter-stage queues with a named overflow policy (Reactive-Streams backpressure).
+4. **Single-writer serve store (actor / LMAX)** — serve-side state owned by one task consuming a command/query queue (`mpsc` consumer / `MailboxProcessor` / `GenServer` / goroutine+channel). No shared `Mutex` over the dataset; the UI sends queries and receives snapshots. Supervised (let-it-crash + restart).
+5. **Fault tolerance** — per-unit isolation, retry-with-backoff+jitter on transient errors only, resume cursor/checkpoint, idempotency/dedupe key.
+6. **Lifecycle state machine + observability** — the boundary emits one typed status stream (`Idle → Opening → … → Ready → Retrying → Error → Done` with progress); logs, metrics, and the UI all derive from it.
+7. **UI via Observer** — the UI subscribes to the status stream (signals / event bus / reactive stream), runs ingest off-thread, renders the current phase + progress, and reads the in-memory `Store` on redraw (never re-parses).
+
+**Per-ecosystem idioms** (consult `community-defaults.md` for the current default before naming a library):
+- **Rust**: `Stream`/`futures` + `tokio` tasks; `mpsc`/`broadcast` for the single-writer store and status; `rayon`/bounded `Semaphore` for CPU fan-out; `tokio::sync::mpsc` (bounded) for backpressure; `ArcSwap` for read-heavy snapshots.
+- **Go**: goroutines + bounded `chan` per stage; `errgroup` for fan-out; a single goroutine owning serve state; context timeouts.
+- **Elixir**: `GenStage`/`Flow`/`Broadway` (backpressure-native), `GenServer` for the store, supervisors for restart.
+- **Python**: `asyncio` + bounded `Queue`; `asyncio.gather`/`TaskGroup` for fan-out; an owner task for serve state; `aiostream`/generators for streaming.
+- **Node/TS**: streams with `highWaterMark` backpressure, `EventEmitter`/observable for status, worker threads for CPU work.
+- **JVM**: Reactor/RxJava (backpressure), `BlockingQueue`-bounded stages, an actor (Akka) or single-thread executor for serve state.
+- **F#/.NET**: `MailboxProcessor<Msg>` for the store, `Channel<T>` (bounded) + `IAsyncEnumerable` for streaming, `IObservable` for status.
+
+**Size to the profile** — see `decision-frameworks.md` §13. A one-shot CLI importer may need only the port + per-record fault isolation + a stdout status line; a streaming desktop app or multi-tenant service needs the full composition. The *boundary*, the *status stream*, and *non-blocking UI* are non-negotiable wherever real I/O latency meets a user; everything else scales.
+
+**Then hand to `app-harden`** to verify the runtime of whatever boundary you prescribe: resource ceilings on the queues/buffers, timeouts on every outbound call, retry-amplification caps, backpressure actually enforced under load, no secret leakage through the data path, crash-loop safety. arch-audit = where the boundary belongs; app-harden = whether it survives production.
+
+---
+
 ## Paradigm adaptations
 
 The smells above are OOP-flavored. Here are translations for other paradigms — apply during Phase 1 classification.
@@ -433,6 +531,7 @@ The smells above are OOP-flavored. Here are translations for other paradigms —
 - **Mixed server/client code**: in Next.js/Remix/SvelteKit, server-only code imported into client bundles. Audit with the framework's own linter.
 
 ### Data pipelines (Airflow, dbt, Spark, ETL)
+> For *application-embedded* ingest→serve paths (a desktop/UI app, an API, or a service that reads data and exposes it), use **§ Data ingestion & serving subsystem** above — it covers streaming, backpressure, fault tolerance, non-blocking UI, and the lifecycle status stream. The bullets here are for *dedicated* orchestration tools.
 - **DAG cycles**: self-evident bug; any cycle is fatal.
 - **Fat task**: single task performing extraction + transformation + load; violates retriability and observability.
 - **Unmanaged state between steps**: tasks sharing state via filesystem/Xcom/globals instead of typed outputs.

@@ -1,0 +1,83 @@
+You will develop a golden-architecture skill.
+
+This skill will be responsible for architectural software design that is based on patterns that have been proven to be effective. These patterns produce stable, easy to manage software solutions that are robust, consistent, do not depend on or block UI.
+
+==========================
+Pattern #1 : Manager
+==========================
+
+If there is a singular responsibility for a resource or a function, we will abstract it away behind a Manager object/class/module or a service where it applies.
+Consider this abstraction around any resource like a hardware device, specific functionality in the application, anything else that needs to be hidden behind an interface to prevent synchronization issues, spaghetti sprawl and resulting code smell.
+
+Examples:
+
+	Download Manager
+		Keeps track of downloads.
+		Exposes currently active or paused downloads via an interface.
+		Keeps track of history if downloads.
+		Spawns and manages threads in the background for downloading.
+		Exposes Events such as DownloadFinished, DownloadStarted, DownloadFailed, etc. with appropriate arguments.
+
+		Can keep statistics like Total bytes, etc.
+
+	
+	Chart Manager
+		Responsible for keeping a single chart or multiple charts populated with candlestick data coming from a cached and optimized data source.
+		Received a Show(Symbol:String) call, and then either shows the data by in the assigned chart, or shows an error in the chart view saying NO DATA.
+		Can be responsible for multiple charts all pointing to same symbol but with different time frames like: 1m, 5m, 15m, 1h, D etc.
+		Can receive partial data updates like Update(Data) that can backfill missing data (historic) or show currently coming in live data.
+		Keeps track of where the 'window' of the chart is pointing to, like moving it along when pointed at current data, or keeping it static pointing at historic segment of the data.
+
+
+	Selection Manager
+		Part of 3D application, keeps track of which objects are selected, manages selection outline in the view.
+		Adds or substracts objects from its Selected collection.
+		Automatically selects child objects in a nested tree of objects.
+		Manager hover, selected, locked outlines around objects.
+
+	Shared Memory Manager
+		Allocates, deallocated memory shares on the system.
+		Manages and synchronized access to the shares.
+		Resizes shares when they are found to be to small to hold the given data.
+		Shrinks them when data has been small for a while.
+		Sends pipe events to notify system processes that data on the share might have changed.
+
+==========================
+Pattern #2 : Mailbox Processor
+==========================
+	
+A simple, but highly performant synchronization abstraction. Receives messages, adds them to queue and processes them one by one as they come in, in the order they came in with.
+Never blocks. All operations can either return result instantly or return nothing while launching background task that will issue a completion message. Exposes event that users can subscribe to, to receive such updates.
+But out events are also processed by main handler as messages.
+
+This is basically a primitive Actor pattern, a class with a mailbox, but one that doesn't necessarily spawn other actors.
+
+	Example : Very long running event
+		System received a Ping(Address) message.
+		Thread is spawned and from within it a Ping is sent to an address, non blocking.
+		On completion (success or failure) the thread will notify the mailbox with another message.
+		System moves on to process other messages.
+		Thread eventually receives a Pong reply and sends PongReceived(Address, DateTimeOfPing, DateTimeOfPong) message to the mailbox.
+		MailboxProcess handles PongReceived message appropriately through a defined handler (in something like a switch statement etc)
+
+==========================
+Pattern #3 : Common Interface
+==========================
+	
+	Whenever there is a provider of certain functionality that can be switched out at runtime, like mail service, network interface, image renderer, LLM text generator etc we might want to hide it behind a common interface.
+	Its basically a collection of common methods that can be used by the rest of the application without knowing anything about the underlying system and its individual quirks.
+	If there are unique features, the interface should accommodate them with unique methods but also provide a way to get feature list to see if these unique features are enabled.
+	
+	One good habit when thinking of using this pattern: if you only have one resource to abstract, and don't see that ever changing, don't use this pattern at all. Only ever use it when there is 1+ resource and potential to grow.
+
+
+==========================
+Pattern #4 : State
+==========================
+
+Whenever there is a bundle of information that needs to be maintained during the application run, or to be saved between application runs, we can utilize a State object to manage it.
+State object should also be created any time there is synchronization need for data access. The state object can be global to the application or per component/abstraction. For instance a Manager abstraction should probably use Sate to manage its internal data.
+A great way to manage data is through synchronization primitives (in multithreaded systems), or even through MailboxProcessor.
+
+
+

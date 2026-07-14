@@ -18,6 +18,7 @@ Every framework here exists because the "obvious" rule is wrong in common cases.
 10. [Fitness functions — turning findings into ongoing enforcement](#10-fitness-functions--turning-findings-into-ongoing-enforcement)
 11. [Priority scoring template](#11-priority-scoring-template) — Pain / Cost ranking
 12. [Execution patterns for large-scale refactors](#12-execution-patterns-for-large-scale-refactors) — Parallel Change · Branch by Abstraction · Strangler Fig · Feature flag/dark launch · Sprout Method · Seam techniques · Boy Scout vs. dedicated PR · Big-bang criteria
+13. [How robust must the ingestion/serving layer be?](#13-how-robust-must-the-ingestionserving-layer-be-proportionality) — proportionality by profile; non-negotiables
 
 ---
 
@@ -385,3 +386,32 @@ Rare, but real. Big-bang refactor (one PR, everything changes) is correct when *
 | Mechanically uniform, no valid intermediate | Big-bang (§12.8) |
 
 Patterns compose: a Strangler Fig slice cutover is usually gated by a feature flag; Branch by Abstraction's final switch can be a Parallel Change at the abstraction's call sites; getting legacy under test (seams) is the prerequisite for any of the above.
+
+---
+
+## 13. How robust must the ingestion/serving layer be? (proportionality)
+
+**The question**: The mandatory ingest→serve pass (SKILL.md Phase 3; catalog § Data ingestion & serving subsystem) fires on any system that ingests and serves data. But a one-shot CLI importer should not carry the machinery of a streaming desktop app. How much robustness is *enough* — and where do you stop calling thinness a finding?
+
+**The audit always demands the boundary, the status surface, and a non-blocking UI; it scales everything else to the profile.** Use this table. Find the closest row; require the "✔ require" column, treat the "△ optional" column as P3-at-most, and do not report the "✘ overkill" items as gaps.
+
+| Profile | ✔ Require (gap = finding) | △ Optional (P3 if missing) | ✘ Overkill (don't report) |
+|---|---|---|---|
+| **One-shot CLI import / batch** (read → transform → write, exits) | A data-access boundary (not I/O smeared across the code); per-record fault isolation (skip+report, don't abort); a stdout/stderr status line; idempotent OR documented "safe to re-run from scratch" | Resume cursor; streaming if input may be large; bounded parallelism over many files | Single-writer actor; reactive UI stream; circuit breakers; metrics pipeline |
+| **Interactive desktop / mobile app with a data backend** (the AutoLabeler shape: opens files/feeds, renders) | Everything above **plus**: non-blocking UI (I/O off the UI thread); a lifecycle **status stream** the UI subscribes to ("Opening/Parsing/Retrying/Done" + progress); streaming/windowing for large data; serve from an in-memory store (no re-parse on redraw); per-unit fault isolation + retry on transient errors | Resume/checkpoint for long ingests; bounded parallelism across files/days; backpressure on live feeds (drop-oldest); structured metrics | Multi-tenant rate limiting; distributed actors; full OTel/tracing stack; HA failover |
+| **Network data service / API** (serves data to remote clients) | Boundary + streaming/pagination; **bounded** queues with named overflow policy (backpressure); timeouts on every outbound call; retry-with-backoff+jitter, transient-only; idempotency keys; metrics (latency/throughput/error rate); graceful degradation under load | Circuit breakers + bulkheads per downstream; CQRS split if read/write asymmetry is real; event log for audit/replay | A UI status stream (no human UI); desktop keychain concerns |
+| **Streaming / real-time** (live feeds, tickers, telemetry, continuous ingest) | All of the service row **plus**: explicit overflow policy per stage (often drop-oldest/sample for lossy live data); supervised restart of long-lived readers; resume-from-offset on reconnect; watermark/lag metric; partitioned single-writer per key | Exactly-once *effect* via dedupe; replay from a durable log (Kafka-style); windowed aggregation framework (Flink/GenStage/Reactor) | Loading the full history into memory; synchronous request/response framing |
+| **Library exposing a data source** | A clean port/interface; bounded resource use; no surprise global I/O on import; documented streaming vs. buffered behavior; errors as values (`Result`/`Either`), not panics | Pluggable retry/backoff policy via injection | Owning a UI status stream; mandating an actor runtime on consumers |
+
+**Non-negotiables (every profile with real I/O latency + a human waiting)** — never size these to zero:
+
+1. **A boundary.** I/O lives behind one abstraction, not smeared across UI/handlers/domain. Without it there is nowhere to add the rest.
+2. **A status surface.** The boundary publishes its phase. For a UI that means a subscribable lifecycle stream; for a headless job, structured logs/metrics. "Frozen window, bare spinner" is always a finding.
+3. **Non-blocking UI.** Latency-bound work never runs on the UI thread. A frozen interface is the most visible robustness failure there is.
+4. **Per-unit fault isolation.** A single bad record/connection must not destroy the whole run.
+
+**The over-engineering test** (mirror of the under-engineering rule): if you are about to recommend an actor runtime, a reactive stream, circuit breakers, or a metrics pipeline for a script that reads one bounded file once and exits, stop — that is the speculative-generality smell (§1, YAGNI) pointed at I/O. Recommend the boundary + fault isolation and move on.
+
+**Profile signal → row**: a UI framework (Dioxus/Electron/Tauri/Qt/React-Native/SwiftUI/WPF) + data reads ⇒ desktop row. A network listener serving data ⇒ service row. A continuous reader/subscriber loop ⇒ streaming row. `main()` that reads, transforms, writes, exits ⇒ CLI row. A published package whose job is data access ⇒ library row. Blends take the union of the stricter requirements.
+
+**Hand-off**: this framework sizes the *structural* ask. Once the boundary exists, `app-harden` sizes the *runtime* ceilings (queue/buffer caps, timeout values, retry limits) against the same profile via its own proportionality rules — the two are designed to align.

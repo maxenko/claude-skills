@@ -47,7 +47,7 @@ In these cases, say so plainly and offer a narrow scope or a different skill.
 ### Phase 1: Scope and orient
 
 1. **Read the entry points**: `package.json`/`pyproject.toml`/`Cargo.toml`/`go.mod`/`pom.xml`, README, any `ARCHITECTURE.md` or `docs/`. If a `CLAUDE.md` exists, read it — it often encodes constraints not visible in code.
-2. **Classify the system**: monolith, modular monolith, microservices, library, framework-based app, data pipeline, frontend SPA, CLI, mixed. Different paradigms have different smells (see `references/smell-catalog.md` § paradigm adaptations).
+2. **Classify the system**: monolith, modular monolith, microservices, library, framework-based app, data pipeline, frontend SPA, CLI, mixed. Different paradigms have different smells (see `references/smell-catalog.md` § paradigm adaptations). **Also note whether the system both *ingests* data from a latency-bound or fallible source (files, DB, sockets, HTTP/streaming feeds, message queues, sensors, large CSV/Parquet/columnar blobs) and *serves* it to a consumer (a UI, an API, another module, an export).** If it does, the ingest→serve path gets a **mandatory pass** in Phase 3 — flag it now so you probe it deliberately.
 3. **Map the top-level structure**: list top-level directories; identify the apparent layering (layered? hex? feature-sliced? flat?).
 4. **Identify the stated architecture** vs. the **actual architecture**. The gap is usually where the smells live.
 5. **Note the scale**: rough LOC, number of top-level modules. Tailor depth of analysis to size — a 5k-LOC service needs different treatment than a 500k-LOC monolith.
@@ -95,6 +95,24 @@ anemic domain model; primitive obsession; **unenforced invariants / missing smar
 
 **Lens 4 — Evolution signals**:
 hotspot-structure mismatch (top churn is not in domain core); shotgun surgery (co-change across unrelated files); parallel inheritance / parallel switch blocks; temporal coupling without type-state enforcement; fossil/dead code; ownership diffusion on hotspots.
+
+#### Mandatory pass — data ingestion & serving subsystem
+
+Run this whenever Phase 1 found the system **both ingests data from a latency-bound or fallible source** (files, DB, sockets, HTTP/streaming feeds, message queues, sensors, large CSV/Parquet/columnar blobs) **and serves that data to a consumer** (a UI, an API, another module, an export). This is not a fifth lens — it is a **promotion rule**: when an ingest→serve path exists, the absence of a dedicated, robust, observable abstraction for it is *always* a finding, ranked by proportionality (Phase 4), never silently dropped. Data movement is where latency, partial failure, and unbounded growth concentrate; "we just read it inline where we need it" is the default and it is almost always wrong at any real scale.
+
+Evaluate the ingest→serve path against this rubric. Each "no" is a candidate finding; load the catalog's **§ Data ingestion & serving subsystem** for detection recipes and the canonical refactor.
+
+1. **Dedicated boundary** — is ingestion + serving owned by ONE abstraction (a `DataSource`/`Repository`/`Store`/ingestion engine with a port in domain vocabulary), or is raw I/O (open / parse / query) scattered through UI handlers, controllers, and domain code? Scattered I/O ⇒ there is no seam to make robust. (Lens 3: missing ports; Lens 2: god component absorbing I/O.)
+2. **Streaming over load-all** — does it stream / window / paginate, or load the whole input into memory before serving? Load-all caps the dataset at RAM and blocks until complete.
+3. **Parallelism where the work allows** — embarrassingly-parallel ingest (per file / day / shard / partition / key) run sequentially while the CPU idles on I/O wait is wasted throughput. Pipeline the stages (read ∥ decode ∥ index) and bound the concurrency.
+4. **Fault tolerance & resumability** — one bad record or dropped connection must not abort the whole run. Need: per-unit isolation, retry with backoff + jitter on *transient* errors only, a resume cursor / checkpoint, idempotent re-ingest (dedupe key), and supervised restart (let-it-crash + supervisor) for the long-lived parts.
+5. **IO-latency tolerance & backpressure** — is the path async / non-blocking with a *bounded* queue + explicit overflow policy between producer and consumer? Unbounded buffering turns a slow consumer into an OOM; no backpressure turns a fast producer into a memory bomb.
+6. **Observability designed in** — does the boundary emit a single, typed **lifecycle/status stream** (a state machine — see below) plus metrics (latency histogram, throughput, queue depth, error/retry rate, bytes in/out)? This stream is the *one* source of truth that feeds logs, metrics, AND the UI — not log lines scattered through the parsing code.
+7. **If there is a UI — non-blocking + "what are we waiting on"** — the latency-bound work must run off the UI thread, and the UI must subscribe to the status stream so it can always tell the user the current phase: *Opening… · Connecting… · Reading… · Parsing… · Indexing… · Serving… · Retrying (attempt n)… · Error · Done*, ideally with progress / ETA. A UI that freezes during open / connect / process, or that shows a bare spinner with no idea what it is waiting on, is a finding. Progress is **data pushed from the boundary**, never the UI reaching into I/O.
+
+**Prescribe the abstraction (Phase 5).** When the rubric shows gaps, the move is almost always the same composition, named explicitly: a **pipes-and-filters ingestion pipeline** (read → decode → validate → index/store; pure filters, I/O at the endpoints) behind a **hexagonal port**, driven by a **single-writer owner** (actor / `MailboxProcessor` / goroutine+channel / `mpsc` consumer) that holds the serve-side state and **emits a lifecycle state machine** the UI consumes via the **Observer** pattern (signals / event bus / reactive stream). This is not new theory — it is the existing catalog entries (single-writer boundary, pipes-and-filters, functional core / imperative shell, missing ports, unidirectional data flow, observability-at-the-boundary) *composed* for the I/O subsystem, plus SEDA-style staged concurrency (Welsh, Culler & Brewer, 2001) and Reactive-Streams backpressure. Size the robustness to the profile via `references/decision-frameworks.md` §13 — a one-shot CLI importer needs far less than a streaming desktop app or a multi-tenant service, but the *boundary*, the *status stream*, and *non-blocking UI* are non-negotiable wherever real I/O latency meets a user.
+
+**Then hand off to `app-harden`.** arch-audit fixes the *structural* gap — that the boundary, the seams, and the event stream exist. Whether that boundary survives production — resource ceilings on the queues / buffers, timeouts on every outbound call, retry-amplification limits, backpressure actually enforced, no secret leakage through the data path, crash-loop safety — is a *runtime* question. Recommend a follow-up `app-harden` pass scoped to this subsystem; the two skills compose (arch-audit = where the boundary belongs; app-harden = whether it holds under load).
 
 **Evidence discipline at each lens**: before you write a finding, record the file path(s), the concrete metric or grep output that triggered detection, and the CS principle. If you cannot, the observation is a hypothesis — mark confidence `low` or discard. Every file path you cite must have been the target of a real `Read` or `Grep` call in this session.
 
@@ -260,8 +278,31 @@ These are the rules, not guidelines. Violating any makes the audit worthless.
 **Confidence**: high — cycle is direct and visible; 6 parallel cases confirm the pattern.
 ```
 
+**Example 3 — Data ingestion & serving (mandatory pass: no robust I/O boundary, blocking UI, no status stream):**
+
+```
+### [P1] Data ingest/serve has no boundary — blocking UI, no observability, aborts on first bad record
+**Location**: src/ui/main_view.rs:88-260 (file open + parse inline in the click handler), src/ui/chart.rs:120-175 (re-reads + re-parses the same CSV on every redraw), src/data/loader.rs:30-95.
+**Evidence**: Opening a dataset calls `std::fs::read_to_string` then a 130-line parse loop *directly inside the UI event handler* — the window is frozen for the whole read+parse (measured ~6 s on a 180 MB / 6-month minute-aggregate file). The whole file is loaded into a `Vec<Bar>` before anything renders (no streaming/windowing). A single malformed row `panic!`s and aborts the entire load. There is no progress indication — the user sees a frozen window, not "Parsing… 40%". Ingest is re-run from scratch on resize/redraw. No retry, no resume cursor, no dedupe — re-importing the same day double-counts. grep shows `read_to_string`/`File::open`/parse logic in 4 files; no `DataSource`/`Store` type exists.
+**Lens**: Mandatory ingest→serve pass (boundary #1, streaming #2, fault-tolerance #4, latency/UI #6–7) + Abstraction (missing ports) + Cohesion (god UI handler).
+**Principle**: Hexagonal ports (Cockburn) — I/O belongs behind a domain-vocabulary boundary, not inline in the view. Functional core / imperative shell (Bernhardt). Pipes-and-filters + SEDA staged concurrency (Welsh, Culler & Brewer) for overlapped read∥decode∥index. Observer (GoF) — the UI consumes a pushed status stream; it never blocks on or reaches into I/O. LMAX single-writer (Thompson) for the serve-side store.
+**Impact**: App is unusable on real-size data (multi-second freezes, OOM ceiling at file size); one bad byte loses the whole import; no way to tell a slow load from a hung one; redundant re-parsing burns CPU every frame.
+**Refactor**:
+  1. Add characterization tests pinning current parse output on 1 good file + 1 file with a bad row (today: panic; target: skip+report).
+  2. Define a port `DataSource` in domain vocab: `fn open(spec) -> Stream<Result<Chunk, IngestError>>` and a serve-side `Store` queried by visible range.
+  3. Build the ingestion as pipes-and-filters: `read → decode → validate → index`, pure filters, I/O only at the endpoints; bound concurrency to a worker pool partitioned by day/file so reads overlap decode.
+  4. Own serve-side state in a single-writer task (tokio `mpsc` consumer / `MailboxProcessor`); the UI sends queries and receives snapshots — no shared `Mutex<Vec<Bar>>`.
+  5. Emit one typed lifecycle stream — `Idle → Opening → Reading{pct} → Parsing{pct} → Indexing → Ready → Retrying{n} → Error{e} → Done` — from the boundary; feed logs/metrics and the UI from it.
+  6. UI subscribes (signal/observer), runs ingest off-thread, and renders the current phase + progress; redraw reads the in-memory `Store`, never re-parses.
+  7. Per-unit fault isolation: bad record → `Err` into the stream, skip, keep going; add a resume cursor and an idempotency key (file+offset / (symbol, ts)) so re-ingest is safe.
+**Seam**: src/data/loader.rs → new `src/data/source.rs` (`DataSource` port + pipeline) and `src/data/store.rs` (single-writer serve store + `LoadStatus` enum); UI depends only on those two interfaces.
+**Rollback signal**: if the `LoadStatus` enum balloons past ~8 variants or the pipeline stages need to share mutable state to work, the staging is wrong — collapse stages before adding more.
+**Confidence**: high — inline I/O in the handler, the panic-on-bad-row, and the re-parse-on-redraw are all directly visible; the freeze is measurable.
+**Follow-up**: after the boundary lands, run `app-harden` scoped to `src/data/` to bound the queue/buffer sizes, set a per-file read timeout, cap retry attempts, and confirm backpressure is enforced (structural seam first, runtime ceilings second).
+```
+
 ## References
 
-- `references/smell-catalog.md` — full catalog of smells with detection recipes, quantified thresholds, and paradigm adaptations (OOP, Rust/Go, functional, frontend, data pipelines). Load at start of Phase 3.
-- `references/decision-frameworks.md` — judgment calls: when to abstract vs. duplicate, when a cycle is fatal vs. tolerable, when layering helps vs. is lasagna, priority scoring, fitness function examples, execution patterns (§12).
+- `references/smell-catalog.md` — full catalog of smells with detection recipes, quantified thresholds, and paradigm adaptations (OOP, Rust/Go, functional, frontend, data pipelines). Load at start of Phase 3. Includes **§ Data ingestion & serving subsystem** — load it when running the mandatory ingest→serve pass.
+- `references/decision-frameworks.md` — judgment calls: when to abstract vs. duplicate, when a cycle is fatal vs. tolerable, when layering helps vs. is lasagna, priority scoring, fitness function examples, execution patterns (§12), and **how robust the ingestion/serving layer must be by profile (§13)**.
 - `references/community-defaults.md` — boring-technology baseline: the community-chosen default library/runtime/tool per ecosystem (Rust, Go, Python, Node, JVM, .NET, Elixir, F#, frontend, workflow, messaging, observability). Load in Phase 5 when prescribing a concrete implementation.

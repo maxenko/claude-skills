@@ -72,6 +72,8 @@ Concrete starting points for the most common shoots. Each recipe states the goal
 
 If using anamorphic: see manual p. 128. The de-squeeze is monitor-only — your recording is still squeezed, and you de-squeeze in post.
 
+**Open Gate gotcha:** 7K 3:2 Open Gate in **Cinema RAW Light caps at 30p** (60p only in compressed codecs). If you need ≥48p for slow-mo *and* open-gate reframing, you can't have both in RAW — drop to a compressed codec or a non-open-gate mode. Open Gate is also the worst rolling-shutter mode (~18 ms), so watch fast motion.
+
 ---
 
 ## Event
@@ -133,6 +135,7 @@ If using anamorphic: see manual p. 128. The de-squeeze is monitor-only — your 
 |---|---|---|
 | Recording format | XF-AVC 4K120 — **NOT Cinema RAW Light** for ≥100 fps | RAW on the C50 is 7K only and capped at 60p. High-frame-rate work has to be non-RAW. Verify per-mode caps at manual p. 214. |
 | Frame rate | 4K up to 119.88p; 2K up to 179.82p | 4K120 needs XF-AVC; 2K180 uses Slow & Fast Motion mode |
+| Crop note | **4K120 = no extra crop** (full width); **2K180 ≈ 12% narrower** angle of view | Go a touch wider on glass for 2K180 |
 | Shutter | 1/240 minimum for 120p (matches 180° rule at higher frame rate) | Cinematic blur at fast capture |
 | ISO | 6400 (base 2) if you need shadow detail in low light; otherwise 800 | High-frame-rate needs lots of light — plan for it |
 | Special record mode | Slow & Fast Motion (manual p. 124) | Sets the camera up for variable frame rate properly |

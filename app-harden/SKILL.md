@@ -214,6 +214,8 @@ If a category is genuinely clean for this profile, write `Category N: no finding
 
 Equally, do not report style or lint issues, architectural preferences, or "consider using X framework." This skill is about *runtime* robustness. Refactoring opinions belong elsewhere.
 
+**Companion — `arch-audit` for the data ingestion/serving subsystem.** When the in-scope code ingests data (files/DB/sockets/streams) and serves it (UI/API/export), this skill bounds and verifies the *runtime* of whatever boundary exists: resource ceilings on queues/buffers, a timeout on every outbound call, retry-amplification caps, backpressure actually enforced under load, no secret leakage through the data path, crash-loop safety. But if the *structural* problem is that there is **no boundary** — I/O smeared through UI handlers and domain code, a UI that freezes during open/parse, no lifecycle/status event stream for the UI to subscribe to, load-everything-into-memory with no streaming — that is a design gap, not a runtime knob. Note it briefly and recommend a scoped **`arch-audit`** pass (its mandatory ingest→serve pass prescribes the dedicated, parallel-capable, fault-tolerant, observable abstraction). The two compose: arch-audit decides *where the boundary belongs*; app-harden verifies *whether it holds under load*.
+
 Before finalizing the report, apply the five proportionality rules in `references/profile-playbooks.md` ("Proportionality rules" section). They exist to catch findings that are technically true but profile-inappropriate.
 
 ## What this skill is not
